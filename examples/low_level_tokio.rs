@@ -46,7 +46,26 @@ async fn main() {
     tokio::spawn(async move {
         loop {
             match state.next().await.unwrap() {
-                Ok(ok) => log::info!("event: {:?}", ok),
+                Ok(ok) => {
+                    log::info!("event: {:?}", ok);
+                    match ok {
+                        rustls_acme::EventOk::DeployedCachedCert(cert) | rustls_acme::EventOk::DeployedNewCert(cert) => {
+                            log::info!("Certificate successfully deployed!");
+                            if let Some(leaf) = cert.leaf_cert_pem() {
+                                log::info!("Leaf certificate available (length: {} bytes)", leaf.len());
+                            }
+                            if let Some(priv_key) = cert.private_key_pem() {
+                                log::info!("Private key available (length: {} bytes)", priv_key.len());
+                            }
+                            if let Some(fullchain) = cert.fullchain_pem() {
+                                log::info!("Fullchain available (length: {} bytes)", fullchain.len());
+                            }
+                            // You can also get the entire PEM (including private key and fullchain)
+                            // let complete_pem = cert.pem();
+                        }
+                        _ => {}
+                    }
+                }
                 Err(err) => log::error!("error: {:?}", err),
             }
         }

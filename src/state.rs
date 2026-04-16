@@ -38,6 +38,7 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     order: Option<Pin<Box<dyn Future<Output = Result<Vec<u8>, OrderError>> + Send>>>,
     backoff_cnt: usize,
     wait: Option<Timer>,
+    current_cert: Option<Certificate>,
 }
 
 impl<EC: 'static + Debug, EA: 'static + Debug> fmt::Debug for AcmeState<EC, EA> {
@@ -48,10 +49,43 @@ impl<EC: 'static + Debug, EA: 'static + Debug> fmt::Debug for AcmeState<EC, EA> 
 
 pub type Event<EC, EA> = Result<EventOk, EventError<EC, EA>>;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub struct Certificate {
+    pem: String,
+}
+
+impl Certificate {
+    /// Returns the full PEM formatted string of the certificate (including the private key, if present).
+    pub fn pem(&self) -> &str {
+        &self.pem
+    }
+
+    /// Returns the private key in PEM format.
+    pub fn private_key_pem(&self) -> Option<&str> {
+        let marker = "-----BEGIN CERTIFICATE-----";
+        self.pem.find(marker).map(|idx| self.pem[..idx].trim())
+    }
+
+    /// Returns the full certificate chain in PEM format.
+    pub fn fullchain_pem(&self) -> Option<&str> {
+        let marker = "-----BEGIN CERTIFICATE-----";
+        self.pem.find(marker).map(|idx| self.pem[idx..].trim())
+    }
+
+    /// Returns only the leaf certificate in PEM format.
+    pub fn leaf_cert_pem(&self) -> Option<&str> {
+        let start_marker = "-----BEGIN CERTIFICATE-----";
+        let end_marker = "-----END CERTIFICATE-----";
+        let start_idx = self.pem.find(start_marker)?;
+        let end_idx = self.pem[start_idx..].find(end_marker)?;
+        Some(self.pem[start_idx..start_idx + end_idx + end_marker.len()].trim())
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum EventOk {
-    DeployedCachedCert,
-    DeployedNewCert,
+    DeployedCachedCert(Certificate),
+    DeployedNewCert(Certificate),
     CertCacheStore,
     AccountCacheStore,
 }
@@ -182,6 +216,12 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             .with_cert_resolver(self.resolver());
         Arc::new(rustls_config)
     }
+
+    /// Returns the current certificate.
+    pub fn current_cert(&self) -> Option<&Certificate> {
+        self.current_cert.as_ref()
+    }
+
     pub fn new(config: AcmeConfig<EC, EA>) -> Self {
         let config = Arc::new(config);
         Self {
@@ -200,6 +240,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             order: None,
             backoff_cnt: 0,
             wait: None,
+            current_cert: None,
         }
     }
     fn parse_cert(pem: &[u8]) -> Result<(CertifiedKey, [DateTime<Utc>; 2]), CertParseError> {
@@ -240,8 +281,11 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             .to_std()
             .unwrap_or_default();
         self.wait = Some(Timer::after(wait_duration));
+        let pem_str = String::from_utf8(pem.clone()).unwrap_or_default();
+        let cert_obj = Certificate { pem: pem_str };
+        self.current_cert = Some(cert_obj.clone());
         if cached {
-            return Ok(EventOk::DeployedCachedCert);
+            return Ok(EventOk::DeployedCachedCert(cert_obj));
         }
         let config = self.config.clone();
         self.early_action = Some(Box::pin(async move {
@@ -250,7 +294,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 Err(err) => Err(EventError::CertCacheStore(err)),
             }
         }));
-        Event::Ok(EventOk::DeployedNewCert)
+        Event::Ok(EventOk::DeployedNewCert(cert_obj))
     }
     async fn order(config: Arc<AcmeConfig<EC, EA>>, resolver: Arc<ResolvesServerCertAcme>, key_pair: Vec<u8>) -> Result<Vec<u8>, OrderError> {
         let directory = Directory::discover(&config.client_config, &config.directory_url).await?;
@@ -454,5 +498,65 @@ impl<EC: 'static + Debug, EA: 'static + Debug> Stream for AcmeState<EC, EA> {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Poll::Ready(Some(ready!(self.poll_next_infinite(cx))))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const DUMMY_PEM: &str = "-----BEGIN PRIVATE KEY-----\nMIIE...dummy_private_key...\n-----END PRIVATE KEY-----\n-----BEGIN CERTIFICATE-----\nMIID...dummy_cert_1...\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nMIID...dummy_cert_2...\n-----END CERTIFICATE-----\n";
+
+    #[test]
+    fn test_event_ok_pem_extraction() {
+        let cert = Certificate { pem: DUMMY_PEM.to_string() };
+        let _event = EventOk::DeployedNewCert(cert.clone());
+
+        let priv_key = cert.private_key_pem().unwrap();
+        assert!(priv_key.starts_with("-----BEGIN PRIVATE KEY-----"));
+        assert!(priv_key.ends_with("-----END PRIVATE KEY-----"));
+        assert!(!priv_key.contains("BEGIN CERTIFICATE"));
+
+        let fullchain = cert.fullchain_pem().unwrap();
+        assert!(fullchain.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(fullchain.ends_with("-----END CERTIFICATE-----"));
+        assert!(!fullchain.contains("BEGIN PRIVATE KEY"));
+        assert!(fullchain.contains("dummy_cert_2"));
+
+        let leaf = cert.leaf_cert_pem().unwrap();
+        assert!(leaf.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(leaf.ends_with("-----END CERTIFICATE-----"));
+        assert!(!leaf.contains("BEGIN PRIVATE KEY"));
+        assert!(leaf.contains("dummy_cert_1"));
+        assert!(!leaf.contains("dummy_cert_2"));
+    }
+
+    #[test]
+    fn test_acme_state_pem_extraction() {
+        use crate::AcmeConfig;
+
+        let config = AcmeConfig::new(["example.com"]);
+        let mut state = config.state();
+        state.current_cert = Some(Certificate { pem: DUMMY_PEM.to_string() });
+
+        let cert = state.current_cert().unwrap();
+
+        let priv_key = cert.private_key_pem().unwrap();
+        assert!(priv_key.starts_with("-----BEGIN PRIVATE KEY-----"));
+        assert!(priv_key.ends_with("-----END PRIVATE KEY-----"));
+        assert!(!priv_key.contains("BEGIN CERTIFICATE"));
+
+        let fullchain = cert.fullchain_pem().unwrap();
+        assert!(fullchain.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(fullchain.ends_with("-----END CERTIFICATE-----"));
+        assert!(!fullchain.contains("BEGIN PRIVATE KEY"));
+        assert!(fullchain.contains("dummy_cert_2"));
+
+        let leaf = cert.leaf_cert_pem().unwrap();
+        assert!(leaf.starts_with("-----BEGIN CERTIFICATE-----"));
+        assert!(leaf.ends_with("-----END CERTIFICATE-----"));
+        assert!(!leaf.contains("BEGIN PRIVATE KEY"));
+        assert!(leaf.contains("dummy_cert_1"));
+        assert!(!leaf.contains("dummy_cert_2"));
     }
 }
