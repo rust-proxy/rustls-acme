@@ -36,6 +36,7 @@ pub struct AcmeState<EC: Debug = Infallible, EA: Debug = EC> {
     load_cert: Option<Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, EC>> + Send>>>,
     load_account: Option<Pin<Box<dyn Future<Output = Result<Option<Vec<u8>>, EA>> + Send>>>,
     order: Option<Pin<Box<dyn Future<Output = Result<Vec<u8>, OrderError>> + Send>>>,
+    order_events: Option<futures::channel::mpsc::UnboundedReceiver<EventOk>>,
     backoff_cnt: usize,
     wait: Option<Timer>,
     current_cert: Option<Certificate>,
@@ -88,6 +89,7 @@ pub enum EventOk {
     DeployedNewCert(Certificate),
     CertCacheStore,
     AccountCacheStore,
+    ValidationChallenge(crate::acme::Challenge),
 }
 
 #[derive(Error, Debug)]
@@ -238,6 +240,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 async move { config.cache.load_account(&config.contact, &config.directory_url).await }
             })),
             order: None,
+            order_events: None,
             backoff_cnt: 0,
             wait: None,
             current_cert: None,
@@ -296,7 +299,12 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
         }));
         Event::Ok(EventOk::DeployedNewCert(cert_obj))
     }
-    async fn order(config: Arc<AcmeConfig<EC, EA>>, resolver: Arc<ResolvesServerCertAcme>, key_pair: Vec<u8>) -> Result<Vec<u8>, OrderError> {
+    async fn order(
+        config: Arc<AcmeConfig<EC, EA>>,
+        resolver: Arc<ResolvesServerCertAcme>,
+        key_pair: Vec<u8>,
+        event_tx: futures::channel::mpsc::UnboundedSender<EventOk>,
+    ) -> Result<Vec<u8>, OrderError> {
         let directory = Directory::discover(&config.client_config, &config.directory_url).await?;
         let account = Account::create_with_keypair(&config.client_config, directory, &config.contact, &key_pair).await?;
 
@@ -311,7 +319,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 OrderStatus::Pending => {
                     // Force in order authorizations to allow single global challenge data state
                     for url in order.authorizations.iter() {
-                        Self::authorize(&config, &resolver, &account, url).await?
+                        Self::authorize(&config, &resolver, &account, url, &event_tx).await?
                     }
                     log::info!("completed all authorizations");
                     order = account.order(&config.client_config, &order_url).await?;
@@ -347,7 +355,13 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             }
         }
     }
-    async fn authorize(config: &AcmeConfig<EC, EA>, resolver: &ResolvesServerCertAcme, account: &Account, url: &String) -> Result<(), OrderError> {
+    async fn authorize(
+        config: &AcmeConfig<EC, EA>,
+        resolver: &ResolvesServerCertAcme,
+        account: &Account,
+        url: &String,
+        event_tx: &futures::channel::mpsc::UnboundedSender<EventOk>,
+    ) -> Result<(), OrderError> {
         let auth = account.auth(&config.client_config, url).await?;
         let (domain, challenge_url) = match auth.status {
             AuthStatus::Pending => {
@@ -372,6 +386,7 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                         challenge
                     }
                 };
+                let _ = event_tx.unbounded_send(EventOk::ValidationChallenge(challenge.clone()));
                 account.challenge(&config.client_config, &challenge.url).await?;
                 (domain, challenge.url.clone())
             }
@@ -447,10 +462,19 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
                 }
             }
 
+            if let Some(events) = &mut self.order_events {
+                match events.poll_next_unpin(cx) {
+                    Poll::Ready(Some(event)) => return Poll::Ready(Ok(event)),
+                    Poll::Ready(None) => self.order_events = None,
+                    Poll::Pending => {}
+                }
+            }
+
             // execute order
             if let Some(order) = &mut self.order {
                 let result = ready!(order.poll_unpin(cx));
                 self.order.take();
+                self.order_events = None; // clear events channel as well
                 match result {
                     Ok(pem) => {
                         self.backoff_cnt = 0;
@@ -488,7 +512,9 @@ impl<EC: 'static + Debug, EA: 'static + Debug> AcmeState<EC, EA> {
             };
             let config = self.config.clone();
             let resolver = self.resolver.clone();
-            self.order = Some(Box::pin(Self::order(config.clone(), resolver.clone(), account_key)));
+            let (tx, rx) = futures::channel::mpsc::unbounded();
+            self.order_events = Some(rx);
+            self.order = Some(Box::pin(Self::order(config.clone(), resolver.clone(), account_key, tx)));
         }
     }
 }

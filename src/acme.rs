@@ -179,7 +179,7 @@ impl Directory {
     }
 }
 
-#[derive(Debug, Deserialize, Eq, PartialEq)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
 pub enum ChallengeType {
     #[serde(rename = "http-01")]
     Http01,
@@ -269,7 +269,7 @@ impl From<&str> for Identifier {
     }
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Clone, Debug, Deserialize)]
 pub struct Challenge {
     #[serde(rename = "type")]
     pub typ: ChallengeType,
